@@ -1,0 +1,375 @@
+---
+title: "Data and model analysis"
+author: "Erica Yoon, M. H. Tessler"
+date: "1/30/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(binom)
+library(rwebppl)
+library(jsonlite)
+library(readr)
+knitr::opts_chunk$set(echo = TRUE)
+library(coda)
+library(magrittr)
+library(ggthemes)
+library(forcats)
+
+# set path to working dir
+local.path <- "~/Documents/Research/cogsci2017/"
+
+estimate_mode <- function(s) {
+  d <- density(s)
+  return(d$x[which.max(d$y)])
+}
+# HPDhi<- function(s){
+hdi_upper <- function(s){
+  m <- HPDinterval(mcmc(s))
+  return(m["var1","upper"])
+}
+# HPDlo<- function(s){
+hdi_lower <- function(s){
+  m <- HPDinterval(mcmc(s))
+  return(m["var1","lower"])
+}
+options("scipen"=10)   
+```
+
+# production prediction data
+
+```{r}
+d.utterance <- read.csv(paste(
+  local.path, 
+  "experiments/processed_data/speaker.csv"
+  , sep="")
+)
+```
+
+```{r}
+d <- d.utterance %>%
+  separate(utterance, into = c("positivity", "utterance"), sep = "_") %>%
+  mutate(true_state = as.factor(true_state),
+         goal = as.factor(goal),
+         positivity = as.factor(positivity),
+         utterance = as.factor(utterance)
+          )
+
+
+ms2 <- d %>%
+  filter(!is.na(positivity), !is.na(utterance)) %>% # why is there NA?
+  group_by(true_state, goal) %>%
+  summarise(n.total=n())
+
+ms3 <- d %>%
+  filter(!is.na(positivity), !is.na(utterance)) %>% # why is there NA?
+  group_by(true_state, goal, positivity, utterance) %>%
+  summarize(n = n())
+
+ms <- left_join(ms2, ms3) %>%
+  group_by(true_state, goal, positivity, utterance) %>%
+  summarize(mean = n / n.total,
+            ci_lower = binom.bayes(n, n.total)$lower,
+            ci_upper = binom.bayes(n, n.total)$upper) 
+  
+ms_fake <- expand.grid(true_state=levels(ms$true_state),
+                             goal=levels(ms$goal),
+                             positivity=levels(ms$positivity), 
+                             utterance=levels(ms$utterance))
+
+ms.all <- left_join(data.frame(ms_fake),data.frame(ms))
+
+ms.all[is.na(ms.all)] <- 0
+
+ms.all %<>%
+  mutate(utterance = fct_relevel(utterance, 
+                                 "terrible", "bad", "okay", "good", "amazing"),
+         goal = fct_relevel(goal, 
+                            "informative", "social", "goal"))
+
+ggplot(data=ms.all, aes(x=utterance, y=mean, fill=positivity, group = positivity, color = positivity)) +
+  geom_line()+
+  facet_grid(goal~true_state) +
+  xlab("no negation (It was ~) vs negation (It wasn't ~) ") +
+  ylab("proportion chosen") +
+  geom_linerange(aes(ymin=ci_lower,ymax=ci_upper), position="dodge") +
+  geom_hline(yintercept=.1, lty=2) +
+  ylim(0,1)+
+  scale_color_solarized()+
+  ggthemes::theme_few()+
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+# Model
+
+### parameters
+
+#### optimalities, cost, value-scaling
+
+```{r alphaOptimalityCost}
+# LOAD BDA RESULTS PARAMS
+load(paste(local.path, "model/results/bda-s2-mcmc80k-x4-params.RData", sep = ""))
+
+bda.params %>%
+  ggplot(., aes(x = val))+
+  geom_histogram()+
+  facet_wrap(~param, scales = "free")
+
+bda.params %>%
+  group_by(param) %>%
+  summarize(MAP = estimate_mode(val),
+            ci_lower = hdi_lower(val),
+            ci_upper = hdi_upper(val))
+```
+
+#### goal weights
+
+```{r inferredGoalWeight}
+# LOAD BDA RESULTS GOAL WEIGHTS
+load(paste(local.path, "model/results/bda-s2-mcmc80k-x4-goalWeights.RData", sep = ""))
+
+ggplot(bda.goalWeights, aes(x = val, fill = goal))+
+  geom_histogram(binwidth=0.1, position = position_dodge())+
+  # ylab("posterior density")+
+  xlab("Inferred speaker informativity weight")
+
+  bda.goalWeights %>% 
+  group_by(param, goal) %>%
+  summarize(
+    MAP = estimate_mode(val),
+            ci_lower = hdi_lower(val),
+            ci_upper = hdi_upper(val))
+```
+      
+      
+### Predictives
+
+#### scatter
+
+```{r expModelTogether}
+## tidy results
+load(paste(local.path, "model/results/bda-s2-mcmc80k-x4-tidy.RData", sep = ""))
+
+ms_model <- bda.utterance.tidy %>%     
+  ungroup() %>%
+  mutate(true_state = state) %>%
+  ungroup() %>%
+  select(-state) %>%
+  mutate(
+    model_MAP = as.numeric(as.character(MAP)),
+    model_ci_upper = as.numeric(as.character(ci_upper)),
+    model_ci_lower = as.numeric(as.character(ci_lower))) %>%
+  select(-MAP, -ci_upper, -ci_lower) %>%
+  mutate(goal = as.factor(goal),
+         true_state = as.factor(true_state),
+         positivity = as.factor(positivity),
+         utterance = as.factor(utterance))
+
+ms_all <- left_join(ms.all,# %>%
+                    ms_model %>%
+                      mutate(positivity = 
+                               factor(positivity, 
+                                   levels = c("no_neg", "neg"),
+                                   labels = c("yes","not")))
+                    ) %>%
+  mutate(diff = (model_MAP - mean)^2)
+```
+
+Look at experiment and model together in scatterplot.
+
+```{r expModelTogether_plot}
+ggplot(ms_all %<>% 
+         mutate(positivity = forcats::fct_relevel(positivity, "yes", "not")) %>%
+         mutate(positivity = forcats::fct_recode(positivity, 
+                                                 "it was" = "yes",
+                                                 "it wasn't" = "not"
+  )), 
+       aes(x = model_MAP, y = mean)) +
+  aes(shape = factor(positivity)) +
+  geom_point(aes(colour = factor(goal), fill = factor(goal)), size = 2) +
+  scale_shape(solid = FALSE) +
+  scale_shape_manual(name = "utterance type", values = c(24, 25))+
+  theme_few()+
+  geom_abline(intercept = 0, slope = 1, linetype = 3) +
+  geom_errorbar(aes(ymin=ci_lower,ymax=ci_upper), alpha = 0.3) +
+  geom_errorbarh(aes(xmin=model_ci_lower,xmax=model_ci_upper), alpha = 0.3) +
+  xlab("Model posterior predictive") +
+  ylab("Human proportion responses") +
+  ylim(0,1) +
+  xlim(0,1) +
+  coord_fixed()+
+  scale_colour_solarized(name = "goal") +
+  scale_fill_solarized() +
+  guides(fill=FALSE)
+
+with(ms_all, cor(mean, model_MAP))^2
+```
+
+Zooming in.
+
+```{r expModelTogether_plot2}
+ggplot(ms_all, aes(x = model_MAP, y = mean, fill=goal, shape = positivity)) +
+  theme_few()+
+  geom_abline(intercept = 0, slope = 1, linetype = 3) +
+  #geom_errorbar(aes(ymin=ci_lower,ymax=ci_upper), alpha = 0.3) +
+  #geom_errorbarh(aes(xmin=model_ci_lower,xmax=model_ci_upper), alpha = 0.3) +
+  geom_point(size = 2,color = 'black') +
+  xlab("Model posterior predictive") +
+  ylab("Human proportion responses") +
+  ylim(0,0.3) +
+  xlim(0,0.3) +
+  coord_fixed()+
+  scale_shape_manual(values = c(24, 25))+
+  scale_fill_solarized()
+```
+
+
+### Negation vs Positive
+
+```{r model_predictions_negNoneg}
+# LOAD BDA NEGATION RESULTS
+load(paste(local.path, "model/results/bda-s2-mcmc80k-x4-negations.RData", sep = ""))
+
+ggplot(data= bda.negations %>%
+         filter(positivity == "negation"), aes(x=state, y=MAP, col=goal, group=goal)) +
+  geom_line(stat="identity", position=position_dodge()) +
+  xlab("true state") +
+  ylab("proportion negation") +
+  geom_linerange(aes(ymin=ci_lower,ymax=ci_upper), position=position_dodge(width=.15)) +
+  scale_colour_discrete(guide = guide_legend(title = "utterance type")) +
+  theme_few()+
+  scale_color_solarized()
+```
+
+Compare model and data for neg vs. no neg.
+
+```{r modelData_negNoneg}
+ms2 <- d %>%
+  group_by(true_state, goal) %>%
+  summarise(n.total=n())
+
+ms3 <- d %>%
+  group_by(true_state, goal, positivity) %>%
+  summarize(n = n())
+
+ms <- left_join(ms2, ms3) %>%
+  group_by(true_state, goal, positivity) %>%
+  summarize(mean = n / n.total,
+            ci_lower = binom.bayes(n, n.total)$lower,
+            ci_upper = binom.bayes(n, n.total)$upper) 
+  
+ms_fake <- expand.grid(true_state=levels(ms$true_state),
+                             goal=levels(ms$goal),
+                             positivity=levels(ms$positivity))
+
+ms.all2 <- left_join(data.frame(ms_fake),data.frame(ms))
+
+ms.all2[is.na(ms.all2)] <- 0
+levels(ms.all2$true_state) <- c("1 heart", "2 hearts", "3 hearts", "4 hearts", "5 hearts")
+levels(ms.all2$goal) <- c("both", "informative", "social")
+levels(ms.all2$positivity) <- c("negation", "no negation")
+
+ms.all2 %<>%
+  mutate(
+         goal = fct_relevel(goal, "informative", "social", "both"))
+
+ms_dataModNeg <- rbind(ms.all2 %>%
+                         mutate(expt = "experimental data") %>%
+                         mutate(true_state = factor(true_state, labels = c(1:5))),
+                       bda.negations %>%
+                         ungroup() %>%
+                         mutate(true_state = state) %>%
+                         # mutate(true_state = factor(state, labels = c("1 heart", "2 hearts", "3 hearts", "4 hearts", "5 hearts"))) %>%
+                         select(-state) %>%
+                         mutate(mean = MAP) %>%
+                         select(-MAP) %>%
+                         mutate(expt = "predictions fit to data"))
+
+# run schematic rmd first
+schematic <- read.csv(paste(local.path,
+                        "model/results/s2_schematic_predictions.csv",
+                        sep = "")) %>%
+  mutate(mean = negation) %>%
+  mutate(true_state = state) %>%
+  mutate(
+    goal = factor(weight, levels = c(0.9, 0.1, 0.5),
+                         labels = c("informative", "social", "both"))
+  ) %>%
+  select(true_state, mean, goal) %>%
+  mutate(positivity = "negation") %>%
+  mutate(expt = "schematic predictions",
+         ci_lower = NA,
+         ci_upper = NA) %>%
+  mutate(ci_lower = as.numeric(ci_lower),
+         ci_upper = as.numeric(ci_upper))
+
+ms_dataModSchemNeg <- rbind(ms_dataModNeg, schematic) %>%
+  mutate(expt = relevel(factor(expt), ref = "schematic predictions"))
+
+ggplot(data= ms_dataModSchemNeg %>%
+         filter(positivity == "negation"), aes(x=true_state, y=mean, col=goal, group=goal)) +
+  geom_line(stat="identity", position=position_dodge()) +
+  facet_grid(.~expt) +
+  xlab("true state") +
+  ylab("proportion negation") +
+  geom_linerange(aes(ymin=ci_lower,ymax=ci_upper), position=position_dodge(width=.1)) +
+  scale_colour_discrete(guide = guide_legend(title = "utterance type")) +
+  ggthemes::theme_few()+
+  scale_color_solarized()
+
+```
+
+```{r model_predictions_eachUtt}
+
+bda.utterance.tidy3_org <- bda.utterance.tidy %>%
+  ungroup() %>%
+  mutate(goal = factor(goal, levels = c("informative", "social", "both"))) %>%
+  mutate(utterance = factor(utterance, levels = c("terrible", "bad", "okay", "good", "amazing")),
+         state = factor(state, labels = c("1 heart", "2 hearts", "3 hearts", "4 hearts", "5 hearts")),
+         positivity = factor(positivity, levels = c( "neg", "no_neg"), labels = c("negation", "no negation")))
+```
+
+Compare experiment vs. data for all utterance productions.
+
+```{r expModelTogether-utt}
+ms_dataMod <- rbind(ms.all %>% 
+                      mutate(expt = "experiment") %>%
+                      mutate(MAP = mean) %>%
+                      select(-mean) %>%
+                      mutate(true_state = factor(true_state, levels = c(1:5)),
+                             true_state = factor(true_state, labels = c("1 heart", "2 hearts", "3 hearts", "4 hearts", "5 hearts")),
+                             positivity = factor(positivity, levels = c("yes", "not")),
+                             positivity = factor(positivity, labels = c("it was", "it wasn't")),
+                             goal = factor(goal, levels = c("informative", "social", "both")), 
+                             goal = factor(goal, labels = c("informative", "social", "both"))), 
+                    bda.utterance.tidy3_org %>% 
+                      mutate(expt = "model") %>%
+                      mutate(true_state = state,
+                             positivity = factor(positivity, levels = c("no negation", "negation")),
+                             positivity = factor(positivity, labels = c("it was", "it wasn't"))) %>%
+                      select(-state)) %>%
+  mutate(expt = as.factor(expt)) %>%
+  mutate(positivity = factor(positivity, levels = c("it wasn't", "it was"))) %>%
+  mutate(goal = factor(goal, levels = c("informative", "social", "both"))) %>%
+  mutate(true_state = factor(true_state, levels = c("1 heart", "2 hearts", "3 hearts", "4 hearts", "5 hearts"))) %>%
+  mutate(true_state = factor(true_state, labels = c("1 heart", "2 hearts", "3 hearts", "4 hearts", "5 hearts")))
+  
+
+ggplot(data=ms_dataMod, aes(x=utterance, y=MAP, color= positivity, linetype = expt, shape = expt, group = interaction(positivity, expt))) +
+  geom_line()+ 
+  facet_grid(goal~true_state) +
+  xlab("negation (it wasn't ~) vs no negation (it was)") +
+  ylab("proportion chosen") +
+  geom_linerange(aes(ymin=ci_lower,ymax=ci_upper), position="dodge") +
+  ylim(0,1)+
+  scale_color_solarized(name = "utterance type")+
+  scale_alpha_discrete(range = c(0.6, 0.8)) +
+  ggthemes::theme_few()+
+  #theme_minimal()+
+  theme(axis.text.x = element_text(angle = 90)) +
+  scale_linetype_discrete(guide = guide_legend(title = "expt vs. model"))
+
+```
