@@ -1,6 +1,6 @@
 # cogsci2017
 
-Model, experiments, data, analyses and paper draft for Yoon, Tessler, Goodman and Frank (submitted): "I won't lie, it wasn't amazing": Modeling polite indirect speech.
+Model, experiments, data, analyses and paper draft for Yoon, Tessler, Goodman and Frank (2017): "I won't lie, it wasn't amazing": Modeling polite indirect speech. Proceedings of the 39th Annual Conference of the Cognitive Science Society. 
 
 ## Links
 
